@@ -1,4 +1,4 @@
-# Quant Journey 🚀
+# Quant Journey 
 
 Projet personnel de formation en mathématiques appliquées, finance quantitative et algorithmique.
 
