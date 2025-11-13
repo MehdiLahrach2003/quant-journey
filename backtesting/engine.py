@@ -1,138 +1,121 @@
 # backtesting/engine.py
-# Core backtesting engine: computes strategy returns, costs, equity curve, and metrics.
-
+# Simple long/short backtest engine for daily data.
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict
 
+from dataclasses import dataclass
+from typing import Dict, Union
+
+import math
 import numpy as np
 import pandas as pd
 
 
-TRADING_DAYS = 252
-_EPS = 1e-12  # Small epsilon to avoid division by ~0 when computing volatility or Sharpe ratio
-
-
 @dataclass
 class BacktestResult:
-    equity: pd.Series
-    returns_ret_under: pd.Series
-    strategy_ret: pd.Series
-    costs: pd.Series
-    positions: pd.Series
-    trades: pd.Series
-    metrics: Dict[str, float]
+    equity: pd.Series          # equity curve
+    returns: pd.Series         # strategy daily returns (net)
+    costs: pd.Series           # daily costs series
+    positions: pd.Series       # aligned positions
+    trades: pd.Series          # abs(position change)
+    metrics: Dict[str, float]  # summary metrics
 
 
-def _safe_series(x: pd.Series, name: str) -> pd.Series:
-    """Ensures a clean pandas Series with a proper name."""
-    s = pd.Series(x, index=x.index if isinstance(x, pd.Series) else None, copy=False)
-    s.name = name
+def _to_price_series(x: Union[pd.Series, pd.DataFrame], col: str = "price") -> pd.Series:
+    """
+    Accept either a Series (already price) or a DataFrame with a 'price' column.
+    """
+    if isinstance(x, pd.Series):
+        s = x.copy()
+    elif isinstance(x, pd.DataFrame):
+        if col not in x.columns:
+            raise ValueError(f"DataFrame must contain '{col}' column.")
+        s = x[col].copy()
+    else:
+        s = pd.Series(x)
+
+    s = s.astype(float).sort_index()
+    s.name = "price"
     return s
 
 
-def _max_drawdown(equity: pd.Series) -> float:
-    """Computes the maximum drawdown (returns the lowest relative drawdown value)."""
-    roll_max = equity.cummax()
-    dd = equity / roll_max - 1.0
-    return float(dd.min())
+def _annualize_sharpe(daily: pd.Series, freq_per_year: int = 252) -> float:
+    r = daily.dropna()
+    if r.empty or r.std() == 0:
+        return 0.0
+    return (r.mean() / r.std()) * math.sqrt(freq_per_year)
 
 
 def run_backtest(
-    df: pd.DataFrame,
-    positions: pd.Series,
-    total_bps: float = 10.0,
+    price_like: Union[pd.Series, pd.DataFrame],
+    positions_like: Union[pd.Series, pd.DataFrame],
+    cost_bps: float = 1.0,
     initial_capital: float = 1.0,
 ) -> BacktestResult:
     """
-    Vectorized long/short backtest engine.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain a 'price' column (indexed by dates).
-    positions : pd.Series
-        Strategy positions per date (aligned with df.index).
-        Expected range: {-1, 0, +1} or continuous weights.
-    total_bps : float, default=10.0
-        Total transaction cost (in basis points), applied to absolute position changes.
-    initial_capital : float, default=1.0
-        Starting portfolio value.
-
-    Returns
-    -------
-    BacktestResult
-        Dataclass containing:
-        - equity curve
-        - underlying and strategy returns
-        - transaction costs and trades
-        - key performance metrics (Sharpe, Volatility, etc.)
-
-    Notes
-    -----
-    - Returns are computed daily based on shifted positions.
-    - Sharpe ratio is protected with a small epsilon (_EPS) to avoid infinite values.
+    Vectorized backtest:
+      - price_like: Series (price) or DataFrame with 'price'
+      - positions_like: Series in {-1,0,+1} (shifted by 1 bar, pas de lookahead)
+      - cost_bps: transaction costs in basis points per trade unit (|Δposition|)
     """
+    price = _to_price_series(price_like)
 
-    if "price" not in df.columns:
-        raise KeyError("DataFrame must contain a 'price' column.")
+    # Positions → Series alignée sur l'index prix
+    if isinstance(positions_like, pd.DataFrame):
+        if "position" in positions_like.columns:
+            pos = positions_like["position"]
+        else:
+            # take first column
+            pos = positions_like.iloc[:, 0]
+    else:
+        pos = positions_like
 
-    prices = df["price"].astype(float).copy()
-    prices.name = "price"
+    pos = pd.Series(pos, index=price.index).reindex(price.index).fillna(0.0).astype(float)
+    pos.name = "position"
 
-    # Underlying returns (simple percentage returns)
-    ret_under = prices.pct_change().fillna(0.0)
-    ret_under = _safe_series(ret_under, "underlying_ret")
+    # Underlying returns
+    ret_under = price.pct_change().fillna(0.0)
 
-    # Clean and align positions
-    positions = positions.reindex(prices.index).fillna(0.0).astype(float)
-    positions.name = "position"
+    # Strategy gross P&L
+    strat_gross = pos.shift(1).fillna(0.0) * ret_under
+    strat_gross.name = "strat_gross"
 
-    # Trades = absolute position change
-    trades = positions.diff().abs().fillna(0.0)
+    # Trades & costs (|Δposition| * cost_bps)
+    trades = pos.diff().abs().fillna(0.0)
     trades.name = "trades"
+    costs = trades * (cost_bps / 10_000.0)
+    costs.name = "costs"
 
-    # Transaction cost rate (bps → percentage)
-    cost_rate = total_bps / 10_000.0
-    costs = (trades * cost_rate).rename("costs")
-
-    # Gross strategy return (position_{t-1} × return_t)
-    strat_gross = positions.shift(1).fillna(0.0) * ret_under
-    strat_gross.name = "strategy_gross"
-
-    # Net return after transaction costs
+    # Net returns & equity
     strat_net = strat_gross - costs
-    strat_net.name = "strategy_net"
+    strat_net.name = "strat_net"
+    equity = (1.0 + strat_net).cumprod() * initial_capital
+    equity.name = "equity"
 
-    # Equity curve
-    equity = (1.0 + strat_net).cumprod() * float(initial_capital)
-    equity = _safe_series(equity, "equity")
-
-    # Metrics calculation
-    mean_daily = float(strat_net.mean())
-    std_daily = float(strat_net.std(ddof=0))
-    std_ann = (std_daily * np.sqrt(TRADING_DAYS)) if std_daily > 0 else 0.0
-    sharpe = (mean_daily * TRADING_DAYS) / max(std_ann, _EPS)
-
-    cumret = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
-    maxdd = _max_drawdown(equity)
+    # Metrics
+    cum_ret = float(equity.iloc[-1] / equity.iloc[0] - 1.0) if len(equity) > 1 else 0.0
+    ann_vol = float(strat_net.std() * math.sqrt(252)) if len(strat_net) > 1 else 0.0
+    sharpe = _annualize_sharpe(strat_net)
+    # Max drawdown
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = float(dd.min()) if not dd.empty else 0.0
     total_costs = float(costs.sum())
 
     metrics = {
-        "cumret": cumret,
-        "ann_vol": std_ann,
-        "sharpe": sharpe,
-        "maxdd": maxdd,
-        "total_costs": total_costs,
+        "Cumulative Return": cum_ret,
+        "Annualized Volatility": ann_vol,
+        "Sharpe Ratio": sharpe,
+        "Max Drawdown": max_dd,
+        "Total Costs": total_costs,
     }
 
     return BacktestResult(
         equity=equity,
-        returns_ret_under=ret_under.rename("underlying_ret"),
-        strategy_ret=strat_net.rename("strategy_ret"),
+        returns=strat_net,
         costs=costs,
-        positions=positions,
+        positions=pos,
         trades=trades,
         metrics=metrics,
     )
+
 
