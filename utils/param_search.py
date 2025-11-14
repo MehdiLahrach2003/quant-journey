@@ -1,10 +1,11 @@
 # utils/param_search.py
-# Grid evaluation + robust selection of the best hyperparameters.
+# Grid-search utilities for SMA crossover parameters.
 
 from __future__ import annotations
-import itertools
+
 import numpy as np
 import pandas as pd
+from typing import Iterable, Tuple
 
 from backtesting.engine import run_backtest
 from backtesting.ma_crossover import sma_crossover_positions
@@ -12,72 +13,52 @@ from backtesting.ma_crossover import sma_crossover_positions
 
 def evaluate_sma_grid(
     df: pd.DataFrame,
-    shorts: list[int],
-    longs: list[int],
-    total_bps: float = 10.0,
+    shorts: Iterable[int],
+    longs: Iterable[int],
+    cost_bps: float = 1.0,
+    criterion: str = "sharpe",         # "sharpe" | "cumret"
     initial_capital: float = 1.0,
-    criterion: str = "sharpe",  # 'sharpe' | 'cumret' | 'maxdd' (only used for the heatmap pivot)
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Evaluate all (short, long) SMA combinations with long > short.
+    Brute-force grid over (short, long) SMA windows.
 
     Returns
     -------
-    results_df : pd.DataFrame
-        One row per (short, long) with key metrics.
-    pivot : pd.DataFrame
-        Pivot table for heatmap visualization on the selected `criterion`.
+    results_df : long-form table with metrics for each (short, long)
+    pivot      : matrix (rows=long, cols=short) of the selected criterion
     """
+    if "price" not in df.columns:
+        raise ValueError("DataFrame must contain 'price'.")
+
+    price = df["price"].astype(float)
+
     rows = []
-    price = df["price"]
+    for s in shorts:
+        for l in longs:
+            if s >= l:
+                continue
 
-    for s, l in itertools.product(shorts, longs):
-        if l <= s:
-            continue
-        pos = sma_crossover_positions(price, s, l)
-        res = run_backtest(df, pos, total_bps=total_bps, initial_capital=initial_capital)
+            pos = sma_crossover_positions(price, short=s, long=l)
+            res = run_backtest(price, pos, cost_bps=cost_bps, initial_capital=initial_capital)
 
-        rows.append({
-            "short": s,
-            "long": l,
-            "cumret": res.metrics["cumret"],
-            "sharpe": res.metrics["sharpe"],
-            "ann_vol": res.metrics["ann_vol"],
-            "maxdd": res.metrics["maxdd"],
-            "total_costs": res.metrics["total_costs"],
-        })
+            rows.append(
+                {
+                    "short": s,
+                    "long": l,
+                    "sharpe": res.metrics.get("Sharpe Ratio", np.nan),
+                    "cumret": res.metrics.get("Cumulative Return", np.nan),
+                    "max_dd": res.metrics.get("Max Drawdown", np.nan),
+                    "total_costs": res.metrics.get("Total Costs", np.nan),
+                }
+            )
 
-    results_df = pd.DataFrame(rows).sort_values(["long", "short"]).reset_index(drop=True)
+    results_df = pd.DataFrame(rows)
+    if results_df.empty:
+        return results_df, pd.DataFrame()
 
-    # Choose the value column for the heatmap
-    value_col = {"sharpe": "sharpe", "cumret": "cumret", "maxdd": "maxdd"}.get(criterion, "sharpe")
-    pivot = results_df.pivot(index="long", columns="short", values=value_col)
+    # pivot for quick inspection / heatmap
+    if criterion not in {"sharpe", "cumret"}:
+        criterion = "sharpe"
+    pivot = results_df.pivot_table(index="long", columns="short", values=criterion, aggfunc="mean")
 
     return results_df, pivot
-
-
-def pick_best_params(results_df: pd.DataFrame, by: str = "sharpe") -> pd.Series:
-    """
-    Selects the best parameter combination from a backtest results DataFrame.
-
-    - 'sharpe' and 'cumret' → maximize
-    - 'maxdd' → minimize (most negative is worst)
-
-    NaN and ±inf are ignored; raises a helpful error if all values are invalid.
-    """
-    if by not in {"sharpe", "cumret", "maxdd"}:
-        raise ValueError("`by` must be one of {'sharpe', 'cumret', 'maxdd'}")
-
-    if by not in results_df.columns:
-        raise KeyError(f"Column '{by}' not found in results_df.")
-
-    s = results_df[by].replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty:
-        raise ValueError(
-            f"No valid values for criterion '{by}'. "
-            "This can happen if volatility ≈ 0 (Sharpe NaN/inf) or returns are empty. "
-            "Try 'cumret', generate longer data, or widen your (short,long) grid."
-        )
-
-    idx = s.idxmax() if by in {"sharpe", "cumret"} else s.idxmin()
-    return results_df.loc[idx]

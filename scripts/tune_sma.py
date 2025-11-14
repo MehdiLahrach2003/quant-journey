@@ -1,92 +1,64 @@
 # scripts/tune_sma.py
-# SMA (short,long) grid search with CSV export and heatmap visualization.
+# Run a grid-search over SMA windows, save CSV, print best params, and (optionally) plot a heatmap.
 
 import os
 import sys
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 
-# Make the project importable when using VS Code "Run" button
+# Make local packages importable when running this file directly
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from utils.data_loader import load_prices
-from utils.param_search import evaluate_sma_grid, pick_best_params
+from utils.param_search import evaluate_sma_grid
 
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 
-def plot_heatmap(pivot: pd.DataFrame, title: str, cmap: str = "viridis"):
-    """
-    Pure-matplotlib heatmap (no seaborn dependency).
-    X-axis: short window; Y-axis: long window.
-    """
-    plt.figure(figsize=(8, 6))
-    data = pivot.values.astype(float)
-    im = plt.imshow(data, aspect="auto", origin="lower", cmap=cmap)
-
-    # Axis ticks with actual window values
-    plt.xticks(range(len(pivot.columns)), pivot.columns.tolist())
-    plt.yticks(range(len(pivot.index)), pivot.index.tolist())
-
-    cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
-    cbar.set_label(pivot.columns.name or "value")
-
-    plt.xlabel("short window")
-    plt.ylabel("long window")
-    plt.title(title)
-    plt.tight_layout()
-
-    # Save figure
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    fig_path = os.path.join(RESULTS_DIR, "sma_grid_heatmap.png")
-    plt.savefig(fig_path, dpi=150)
-    print(f"[OK] Heatmap saved to: {fig_path}")
-
-    plt.show()
-
-
 def main():
-    # 1) Load prices
-    df = load_prices()  # expects df['price']
+    df = load_prices()
 
-    # 2) Define parameter grid
-    shorts = list(range(5, 31, 5))     # 5,10,15,20,25,30
-    longs  = list(range(40, 121, 10))  # 40,50,...,120
+    shorts = [5, 10, 20, 30, 40]
+    longs  = [50, 80, 100, 150, 200]
 
-    # 3) Evaluate all combinations and create a pivot for heatmap
-    total_bps = 10.0  # total trading costs (bps) per absolute position change
     results_df, pivot = evaluate_sma_grid(
-        df, shorts, longs,
-        total_bps=total_bps,
-        initial_capital=1.0,
+        df,
+        shorts,
+        longs,
+        cost_bps=1.0,            # <- use 'cost_bps' (not total_bps / trans_cost_bps)
         criterion="sharpe",
+        initial_capital=1.0,
     )
 
-    # 4) Save raw results
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_csv = os.path.join(RESULTS_DIR, "sma_grid_results.csv")
     results_df.to_csv(out_csv, index=False)
     print(f"[OK] Results saved to: {out_csv}")
 
-    # 5) Pick best params (robust to NaN/±inf)
-    try:
-        best = pick_best_params(results_df, by="sharpe")
-        by_used = "sharpe"
-    except ValueError as e:
-        print(f"[WARN] {e}")
-        print("[INFO] Falling back to 'cumret' criterion.")
-        best = pick_best_params(results_df, by="cumret")
-        by_used = "cumret"
+    if not pivot.empty:
+        print("\n=== Best params (by Sharpe) ===")
+        best_long, best_short = pivot.stack().idxmax()  # (long, short)
+        best_val = pivot.max().max()
+        print(f"short={best_short}, long={best_long}, sharpe={best_val:.4f}")
 
-    print(f"\n=== Best params (by {by_used}) ===")
-    print(best)
-
-    # 6) Plot heatmap
-    pivot.columns.name = "short"
-    pivot.index.name = "long"
-    plot_heatmap(pivot, title=f"SMA Grid Search — {by_used.capitalize()}")
+        # Simple heatmap
+        fig, ax = plt.subplots(figsize=(8, 5))
+        im = ax.imshow(pivot.values, aspect="auto", origin="lower")
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_xticklabels(pivot.columns)
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_yticklabels(pivot.index)
+        ax.set_xlabel("short window")
+        ax.set_ylabel("long window")
+        ax.set_title("SMA grid — Sharpe")
+        plt.colorbar(im, ax=ax)
+        out_png = os.path.join(RESULTS_DIR, "sma_grid_heatmap.png")
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=150)
+        print(f"[OK] Heatmap saved to: {out_png}")
+        plt.show()
+    else:
+        print("[WARN] Empty pivot — check grids or data length.")
 
 
 if __name__ == "__main__":
