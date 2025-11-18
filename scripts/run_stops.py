@@ -1,74 +1,92 @@
 # scripts/run_stops.py
-# Demo: SMA crossover -> optional vol-target -> apply stops -> backtest
+# Compare SMA crossover with and without stop-loss / take-profit.
 
-from __future__ import annotations
 import os
 import sys
 import matplotlib.pyplot as plt
 
-# Allow "import backtesting / utils"
+# --- Make 'quant-journey' package importable ---
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from utils.data_loader import load_prices
 from backtesting.ma_crossover import sma_crossover_positions
-from backtesting.risk import vol_target_positions
-from backtesting.rules import apply_stops
 from backtesting.engine import run_backtest
+from backtesting.rules import StopConfig, apply_stop_loss_take_profit
 
 
-def plot_equity(result, title="Equity"):
-    eq = result.equity
-    plt.figure(figsize=(11, 5))
-    plt.plot(eq.index, eq.values, label="Equity", lw=1.6)
-    plt.fill_between(eq.index, eq.values, eq.cummax(), alpha=0.12, color="red")
-    plt.title(title)
-    plt.ylabel("Capital")
-    plt.grid(alpha=0.3)
+def plot_equity_comparison(base_res, stopped_res):
+    """Plot equity curves for baseline SMA and SMA + stops."""
+    eq_base = base_res.equity / base_res.equity.iloc[0]
+    eq_stop = stopped_res.equity / stopped_res.equity.iloc[0]
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(eq_base.index, eq_base, label="SMA 20/100 (no stops)", lw=1.4)
+    plt.plot(eq_stop.index, eq_stop, label="SMA 20/100 + stops", lw=1.4)
+
+    plt.axhline(1.0, color="black", lw=0.8, ls="--")
+    plt.title("Equity curve: SMA crossover with vs without stops")
+    plt.ylabel("Equity (rebased to 1.0)")
     plt.legend()
-    out = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "stops_equity.png")
+    plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(out, dpi=140)
-    print(f"[OK] Equity plot saved -> {out}")
+
+    out_png = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "stops_equity.png")
+    plt.savefig(out_png, dpi=150)
+    print(f"[OK] Equity comparison saved → {out_png}")
     plt.show()
 
 
+def print_metrics(title: str, result):
+    """Pretty-print result metrics."""
+    print(f"\n===== {title} =====")
+    for k, v in result.metrics.items():
+        print(f"{k:25s}: {v:.4f}")
+    print(f"{'Final equity':25s}: {result.equity.iloc[-1]:.4f}")
+
+
 def main():
-    # 1) Load prices (synthetic fallback if no CSV)
+    # 1) Load prices
     df = load_prices()
     price = df["price"]
-    returns = price.pct_change().fillna(0.0)
 
-    # 2) Base signal (SMA crossover)
-    pos_raw = sma_crossover_positions(price, short=20, long=100)
+    # 2) Build baseline positions
+    base_positions = sma_crossover_positions(price, short=20, long=100)
 
-    # 3) (Optional) Vol targeting on top of SMA (comment out if you want raw)
-    pos_vt = vol_target_positions(
-        returns=returns,
-        positions=pos_raw,
-        target_vol_annual=0.10,
-        lookback=20,
-        max_leverage=3.0,
+    # 3) Backtest baseline (NO NAMED ARGUMENT 'price=' !!!)
+    base_res = run_backtest(
+        price,
+        base_positions,
+        cost_bps=1.0,
+        initial_capital=1.0,
     )
 
-    # 4) Apply stops on the (possibly vol-targeted) exposure
-    pos_stopped = apply_stops(
-        prices=price,
-        positions=pos_vt,
-        stop_loss_pct=0.05,      # 5% SL
-        take_profit_pct=0.10,    # 10% TP
-        trailing=True,           # trailing behavior
+    # 4) Stop parameters
+    cfg = StopConfig(
+        stop_loss_pct=0.05,
+        take_profit_pct=0.10,
     )
 
-    # 5) Backtest (same engine API as d’habitude)
-    res = run_backtest(df, pos_stopped, cost_bps=1.0)
+    # 5) Apply stop-loss / take-profit
+    stopped_positions = apply_stop_loss_take_profit(
+        prices =price,
+        base_positions=base_positions,
+        config=cfg,
+    )
 
-    print("\n===== Backtest with Stops (SMA 20/100, vol-target 10%, SL 5%, TP 10%) =====")
-    for k, v in res.metrics.items():
-        print(f"{k:25s}: {v:.4f}")
-    print(f"\nFinal equity: {res.equity.iloc[-1]:.2f}")
+    # 6) Backtest with stops
+    stopped_res = run_backtest(
+        price,
+        stopped_positions,
+        cost_bps=1.0,
+        initial_capital=1.0,
+    )
 
-    # 6) Plot
-    plot_equity(res, title="SMA 20/100 + VolTarget + Stops")
+    # 7) Print metrics
+    print_metrics("SMA 20/100 (no stops)", base_res)
+    print_metrics("SMA 20/100 + stops", stopped_res)
+
+    # 8) Plot result
+    plot_equity_comparison(base_res, stopped_res)
 
 
 if __name__ == "__main__":

@@ -1,154 +1,111 @@
 # backtesting/rules.py
-# Stop/Take-Profit overlay (supports long/short, fractional exposure, optional trailing)
+# Simple trading rules: stop-loss / take-profit on top of a base signal.
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
 import pandas as pd
 
 
-def apply_stops(
+@dataclass
+class StopConfig:
+    """
+    Configuration for stop-loss and take-profit rules.
+
+    pct values are expressed in decimals:
+    - 0.05  = 5% move against you (stop-loss)
+    - 0.10  = 10% move in your favour (take-profit)
+    """
+    stop_loss_pct: Optional[float] = None    # e.g. 0.05 for -5%
+    take_profit_pct: Optional[float] = None  # e.g. 0.10 for +10%
+
+
+def apply_stop_loss_take_profit(
     prices: pd.Series,
-    positions: pd.Series,
-    stop_loss_pct: float | None = 0.05,     # 5% loss
-    take_profit_pct: float | None = 0.10,   # 10% gain
-    trailing: bool = True,                  # trailing TP/SL when True
+    base_positions: pd.Series,
+    config: StopConfig,
 ) -> pd.Series:
     """
-    Apply stop-loss / take-profit to a raw position series.
-
-    Rules (per continuous stream of exposure):
-    - A "trade" starts when exposure crosses 0 -> non-zero.
-    - While in a trade, compute PnL vs entry:
-        * Long: r_t = price_t / entry_price - 1
-        * Short: r_t = entry_price / price_t - 1
-    - Hit stop-loss => flat (0) until the raw signal re-arms by crossing through 0 again.
-    - Hit take-profit => same (flat) behavior.
-    - trailing=True: the reference updates in favor of the trade:
-        * Long: trail by highest close since entry (uses peak to compute drawdown).
-        * Short: trail by lowest close since entry (mirror logic).
-    - Fractional exposures are supported (e.g. vol-targeted 0.0..±3.0). Stop logic
-      is driven by sign (long vs short). Magnitude is preserved until a stop flattens it.
+    Apply stop-loss / take-profit rules on top of a base position series.
 
     Parameters
     ----------
     prices : pd.Series
-        Price series indexed by dates.
-    positions : pd.Series
-        Raw exposure (float allowed). Must be aligned to prices and already shifted.
-    stop_loss_pct : float or None
-        Stop-loss threshold (e.g., 0.05 => 5%). None disables SL.
-    take_profit_pct : float or None
-        Take-profit threshold (e.g., 0.10 => 10%). None disables TP.
-    trailing : bool
-        Use trailing reference (peak for longs, trough for shorts).
+        Price series indexed by dates (close-to-close).
+    base_positions : pd.Series
+        Raw trading signal (e.g. from SMA crossover), values in {-1, 0, +1}.
+        We assume this is already shifted by 1 bar to avoid lookahead.
+    config : StopConfig
+        Stop-loss and take-profit configuration.
 
     Returns
     -------
     pd.Series
-        Exposure after stops (0 when stopped, original exposure otherwise).
+        New position series in {-1, 0, +1} where stops have been enforced.
+
+    Notes
+    -----
+    - We work at end-of-day resolution: if a stop is hit on day t, we
+      assume we exit at the close of day t (approximation).
+    - Logic is deliberately simple and explicit (loop over time) so that
+      it stays easy to understand and debug.
     """
-    px = prices.astype(float).copy()
-    pos = positions.astype(float).fillna(0.0).copy()
-    pos_out = pos.copy()
+    prices = prices.astype(float)
+    pos_raw = base_positions.reindex(prices.index).fillna(0.0)
 
-    # State variables
-    in_trade = False
-    trade_side = 0            # +1 long, -1 short
-    entry_price = None
-    peak = None               # highest price since entry (long)
-    trough = None             # lowest price since entry (short)
-    armed = True              # requires a 0-crossing to re-arm after a stop
+    stop_loss = config.stop_loss_pct
+    take_profit = config.take_profit_pct
 
-    idx = px.index
+    pos = pos_raw.copy()
+    pos.values[:] = 0.0  # we will rebuild positions bar by bar
 
-    for t in idx:
-        raw = pos.loc[t]
-        price = px.loc[t]
-        sign = 0 if raw == 0 else (1 if raw > 0 else -1)
+    in_pos: float = 0.0         # current position: -1, 0, +1
+    entry_price: Optional[float] = None
 
-        # (Re-)arm logic: we only re-arm when the raw signal passes through 0
-        if sign == 0:
-            armed = True
+    for i, (dt, price) in enumerate(prices.items()):
+        desired = float(pos_raw.iloc[i])
 
-        if not in_trade:
-            # Can we open a trade?
-            if armed and sign != 0:
-                in_trade = True
-                trade_side = sign
-                entry_price = price
-                peak = price
-                trough = price
-                pos_out.loc[t] = raw
-            else:
-                pos_out.loc[t] = 0.0
+        # If we are flat, we can enter according to the raw signal
+        if in_pos == 0.0:
+            if desired != 0.0:
+                in_pos = desired
+                entry_price = float(price)
+            pos.iloc[i] = in_pos
             continue
 
-        # We are in a trade (trade_side set). If signal changed sign, treat as exit/flip.
-        if sign == 0 or sign != trade_side:
-            # Exit to 0 when raw says flat or flipped side (engine will account costs)
-            in_trade = False
-            trade_side = 0
+        # We are currently in a position
+        assert entry_price is not None
+        ret_since_entry = price / entry_price - 1.0
+
+        hit_stop = (
+            stop_loss is not None
+            and ret_since_entry <= -abs(stop_loss)
+        )
+        hit_tp = (
+            take_profit is not None
+            and ret_since_entry >= abs(take_profit)
+        )
+
+        if hit_stop or hit_tp:
+            # Exit the position because stop or take-profit is triggered
+            in_pos = 0.0
             entry_price = None
-            peak = None
-            trough = None
-            pos_out.loc[t] = 0.0
-            # If flipped, do NOT auto-open on the same bar; a new bar will re-evaluate.
-            if sign == 0:
-                armed = True
-            else:
-                armed = False  # require a 0-cross to re-arm after flip
+            pos.iloc[i] = 0.0
             continue
 
-        # Still in same-side trade: update trail references
-        if trailing:
-            if trade_side > 0:
-                peak = max(peak, price)
-            else:
-                trough = min(trough, price)
-
-        # Compute running return vs entry (or vs trailing anchor if trailing)
-        if trade_side > 0:
-            ref = peak if trailing else entry_price
-            # Drawdown from peak is (price/ref - 1)
-            run_ret = price / (entry_price if not trailing else ref) - 1.0
-            # For stop-loss on long with trailing we consider drawdown from peak:
-            drawdown = price / peak - 1.0 if trailing else run_ret
-        else:
-            ref = trough if trailing else entry_price
-            # For short: profit increases when price falls
-            run_ret = (entry_price if not trailing else ref) / price - 1.0
-            # For trailing SL on short we consider adverse move from trough:
-            drawup = trough / price - 1.0 if trailing else run_ret  # negative when favorable
-
-        hit_sl = False
-        hit_tp = False
-
-        if trade_side > 0:
-            if stop_loss_pct is not None:
-                # adverse move for long (drawdown if trailing, else run_ret < -SL)
-                if (trailing and drawdown <= -stop_loss_pct) or (not trailing and run_ret <= -stop_loss_pct):
-                    hit_sl = True
-            if take_profit_pct is not None and run_ret >= take_profit_pct:
-                hit_tp = True
-        else:
-            if stop_loss_pct is not None:
-                # adverse move for short (price rising). If trailing: "drawup" >= SL
-                if (trailing and drawup >= stop_loss_pct) or (not trailing and run_ret <= -stop_loss_pct):
-                    hit_sl = True
-            if take_profit_pct is not None and run_ret >= take_profit_pct:
-                hit_tp = True
-
-        if hit_sl or hit_tp:
-            # Flat and disarm until raw crosses zero again
-            in_trade = False
-            trade_side = 0
+        # No stop triggered → follow the base signal if it wants to close/reverse
+        if desired == 0.0:
+            # Signal says "flat": we exit
+            in_pos = 0.0
             entry_price = None
-            peak = None
-            trough = None
-            pos_out.loc[t] = 0.0
-            armed = False
-        else:
-            # Keep raw exposure magnitude (can be fractional)
-            pos_out.loc[t] = raw
+        elif desired != in_pos:
+            # Signal wants to reverse (from +1 to -1 or the opposite)
+            in_pos = desired
+            entry_price = float(price)
 
-    pos_out.name = "position_with_stops"
-    return pos_out
+        pos.iloc[i] = in_pos
+
+    pos.name = "position_with_stops"
+    return pos
