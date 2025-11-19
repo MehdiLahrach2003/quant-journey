@@ -1,7 +1,7 @@
 # scripts/make_report.py
 # Build a tear sheet for the plain SMA 20/100 crossover strategy.
 #
-# You run this file (Run ▶️) to:
+# You run this file to:
 # - load prices (or generate synthetic ones),
 # - build SMA crossover positions,
 # - run the backtest,
