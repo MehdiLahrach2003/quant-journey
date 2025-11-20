@@ -1,173 +1,157 @@
 # backtesting/report.py
-# Tools to compute performance statistics and plot a simple tear sheet.
+"""
+Reporting helpers for backtests:
+- Drawdown and rolling Sharpe computation
+- Tear sheet plot (equity, rolling Sharpe, drawdown)
+- Trade log export to CSV
+"""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-# ---------- Core statistics helpers ----------
-
-def compute_rolling_sharpe(
-    returns: pd.Series,
-    window: int = 126,
-    periods_per_year: int = 252,
-) -> pd.Series:
+@dataclass
+class BacktestResult:
     """
-    Compute rolling Sharpe ratio on a window of daily returns.
-
-    Parameters
-    ----------
-    returns : pd.Series
-        Strategy returns (daily or whatever frequency you use).
-    window : int
-        Rolling window size in bars (126 ~ 6 months of daily data).
-    periods_per_year : int
-        Number of periods per year (252 for daily).
-
-    Returns
-    -------
-    pd.Series
-        Rolling Sharpe ratio.
+    Container for everything returned by the backtest engine.
     """
-    r = returns.astype(float)
-    roll_mean = r.rolling(window).mean()
-    roll_std = r.rolling(window).std()
+    equity: pd.Series
+    returns_under: pd.Series        # underlying simple returns
+    strategy_ret: pd.Series         # strategy simple returns (net of costs)
+    costs: pd.Series                # transaction costs time series
+    positions: pd.Series            # position in {-1, 0, +1} (or size)
+    trades: Optional[pd.DataFrame]  # trade log (one row per trade)
+    metrics: Dict[str, Any]         # summary metrics (Sharpe, max DD, etc.)
 
-    sharpe = np.sqrt(periods_per_year) * roll_mean / roll_std
-    sharpe.name = "rolling_sharpe"
-    return sharpe
 
+# ---------------------------------------------------------------------------
+# Risk / performance helpers
+# ---------------------------------------------------------------------------
 
 def compute_drawdown(equity: pd.Series) -> pd.Series:
     """
-    Compute percentage drawdown series from an equity curve.
+    Compute drawdown series from an equity curve.
 
-    Parameters
-    ----------
-    equity : pd.Series
-        Equity curve (portfolio value over time).
-
-    Returns
-    -------
-    pd.Series
-        Drawdown in decimal form (e.g. -0.15 = -15%).
+    Drawdown_t = equity_t / max_{s <= t}(equity_s) - 1
     """
     eq = equity.astype(float)
-    peak = eq.cummax()
-    dd = eq / peak - 1.0
+    running_max = eq.cummax()
+    dd = eq / running_max - 1.0
     dd.name = "drawdown"
     return dd
 
 
-def summarize_equity(
-    equity: pd.Series,
-    returns: pd.Series,
-    periods_per_year: int = 252,
-) -> Dict[str, float]:
+def rolling_sharpe(returns: pd.Series, window: int = 126) -> pd.Series:
     """
-    Build a small dict of summary statistics.
+    Compute rolling Sharpe ratio on a window of `window` observations.
 
-    This is mostly for printing in the terminal and saving to CSV.
+    Here we assume returns are daily simple returns and use:
+        Sharpe = mean(ret) / std(ret) * sqrt(252)
     """
-    r = returns.astype(float).dropna()
-    eq = equity.astype(float)
-
-    total_return = eq.iloc[-1] / eq.iloc[0] - 1.0
-    avg_ret = r.mean()
-    vol = r.std()
-    sharpe = np.sqrt(periods_per_year) * avg_ret / vol if vol > 0 else np.nan
-
-    dd = compute_drawdown(eq)
-    max_dd = dd.min()
-
-    stats = {
-        "total_return": float(total_return),
-        "annualized_return": float((1 + total_return) ** (periods_per_year / len(eq)) - 1)
-        if len(eq) > 0
-        else np.nan,
-        "annualized_vol": float(vol * np.sqrt(periods_per_year)),
-        "sharpe_ratio": float(sharpe),
-        "max_drawdown": float(max_dd),
-    }
-    return stats
+    r = returns.astype(float)
+    roll_mean = r.rolling(window).mean()
+    roll_std = r.rolling(window).std(ddof=1)
+    sharpe = roll_mean / roll_std * np.sqrt(252.0)
+    sharpe.name = f"rolling_sharpe_{window}"
+    return sharpe
 
 
-# ---------- Plotting helpers ----------
+# ---------------------------------------------------------------------------
+# Tear sheet plotting
+# ---------------------------------------------------------------------------
 
-def plot_tear_sheet(
-    equity_rebased: pd.Series,
-    benchmark_rebased: Optional[pd.Series] = None,
-    rolling_sharpe: Optional[pd.Series] = None,
-    drawdown: Optional[pd.Series] = None,
-    title: str = "Equity (rebased) vs Benchmark",
-    save_path: Optional[str] = None,
+def make_tear_sheet(
+    result: BacktestResult,
+    price: pd.Series,
+    out_png: Optional[str] = None,
 ) -> None:
     """
-    Plot a 3-panel tear sheet:
-    1) Strategy equity vs buy & hold (both rebased to 1.0),
-    2) Rolling Sharpe ratio,
-    3) Drawdown.
+    Plot a simple tear sheet with:
+    - Strategy equity vs buy & hold (both rebased to 1.0)
+    - Rolling Sharpe (126 days)
+    - Drawdown
 
-    If save_path is provided, the figure is saved as PNG.
+    Parameters
+    ----------
+    result : BacktestResult
+        Output of the backtest engine.
+    price : pd.Series
+        Underlying price series (indexed by date).
+    out_png : str, optional
+        If provided, save the figure to this path.
     """
-    fig, axes = plt.subplots(
-        3,
-        1,
-        figsize=(12, 8),
+    eq = result.equity.astype(float)
+    eq_rebased = eq / eq.iloc[0]
+
+    bh = price.astype(float) / price.iloc[0]
+    bh.name = "buy_and_hold"
+
+    dd = compute_drawdown(eq)
+    roll_sh = rolling_sharpe(result.strategy_ret, window=126)
+
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, figsize=(12, 9),
         sharex=True,
         gridspec_kw={"height_ratios": [2, 1, 1]},
     )
 
-    ax_eq, ax_sharpe, ax_dd = axes
+    # 1) Equity vs benchmark
+    ax1.plot(eq_rebased.index, eq_rebased, label="Strategy", lw=1.5)
+    ax1.plot(bh.index, bh, label="Buy & Hold", lw=1.2)
+    ax1.set_ylabel("Index (× start)")
+    ax1.set_title("Equity (rebased) vs Benchmark")
+    ax1.legend()
+    ax1.grid(alpha=0.3)
 
-    # --- 1) Equity vs benchmark ---
-    ax_eq.plot(equity_rebased.index, equity_rebased, label="Strategy", lw=1.4)
-    if benchmark_rebased is not None:
-        ax_eq.plot(
-            benchmark_rebased.index,
-            benchmark_rebased,
-            label="Buy&Hold",
-            lw=1.2,
-        )
+    # 2) Rolling Sharpe
+    ax2.plot(roll_sh.index, roll_sh, lw=1.2)
+    ax2.axhline(0.0, color="black", lw=0.8)
+    ax2.set_ylabel("Sharpe")
+    ax2.set_title("Rolling Sharpe (126d)")
+    ax2.grid(alpha=0.3)
 
-    ax_eq.set_ylabel("Index (x start)")
-    ax_eq.set_title(title)
-    ax_eq.legend()
-    ax_eq.grid(alpha=0.3)
-
-    # --- 2) Rolling Sharpe ---
-    if rolling_sharpe is not None:
-        ax_sharpe.plot(rolling_sharpe.index, rolling_sharpe, lw=1.0)
-    ax_sharpe.axhline(0.0, color="black", lw=0.8)
-    ax_sharpe.set_ylabel("Sharpe")
-    ax_sharpe.set_title("Rolling Sharpe (126d)")
-    ax_sharpe.grid(alpha=0.3)
-
-    # --- 3) Drawdown ---
-    if drawdown is not None:
-        ax_dd.fill_between(
-            drawdown.index,
-            drawdown,
-            0.0,
-            step="pre",
-            alpha=0.3,
-        )
-    ax_dd.set_ylabel("Drawdown")
-    ax_dd.set_title("Drawdown")
-    ax_dd.grid(alpha=0.3)
+    # 3) Drawdown
+    ax3.fill_between(dd.index, dd, 0.0, color="steelblue", alpha=0.4)
+    ax3.set_ylabel("Drawdown")
+    ax3.set_title("Drawdown")
+    ax3.grid(alpha=0.3)
 
     plt.tight_layout()
 
-    if save_path is not None:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=150)
-        print(f"[OK] Tear sheet saved -> {save_path}")
+    if out_png is not None:
+        os.makedirs(os.path.dirname(out_png), exist_ok=True)
+        plt.savefig(out_png, dpi=150)
+        print(f"[OK] Tear sheet saved → {out_png}")
 
     plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Trade log export
+# ---------------------------------------------------------------------------
+
+def export_trades_to_csv(result: BacktestResult, out_csv: str) -> None:
+    """
+    Export the trade log contained in `result.trades` to a CSV file.
+
+    The function is safe to call even if there are no trades.
+    """
+    trades = result.trades
+
+    if trades is None or len(trades) == 0:
+        print("[WARN] No trades found in BacktestResult.trades, nothing to export.")
+        return
+
+    out_dir = os.path.dirname(out_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    trades.to_csv(out_csv, index=True)
+    print(f"[OK] Trades exported → {out_csv}")
