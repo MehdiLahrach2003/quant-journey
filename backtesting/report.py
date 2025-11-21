@@ -58,7 +58,30 @@ def rolling_sharpe(returns: pd.Series, window: int = 126) -> pd.Series:
     r = returns.astype(float)
     roll_mean = r.rolling(window).mean()
     roll_std = r.rolling(window).std(ddof=1)
+
     sharpe = roll_mean / roll_std * np.sqrt(252.0)
+    sharpe.name = f"rolling_sharpe_{window}"
+    return sharpe
+
+
+def compute_rolling_sharpe(
+    returns: pd.Series,
+    window: int = 126,
+    ann_factor: int = 252,
+) -> pd.Series:
+    """
+    Backward-compatible wrapper used by some scripts.
+
+    It does the same thing as `rolling_sharpe`, but with an explicit
+    annualization factor argument so older imports still work:
+        from backtesting.report import compute_rolling_sharpe
+    """
+    r = returns.astype(float)
+    roll_mean = r.rolling(window).mean()
+    roll_std = r.rolling(window).std(ddof=1)
+
+    sharpe = roll_mean / roll_std * np.sqrt(float(ann_factor))
+    sharpe = sharpe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     sharpe.name = f"rolling_sharpe_{window}"
     return sharpe
 
