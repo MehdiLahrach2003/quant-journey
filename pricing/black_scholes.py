@@ -1,52 +1,72 @@
+# pricing/black_scholes.py
+"""
+Black–Scholes pricing helpers for European options.
+Vectorised with NumPy to work on scalars or arrays.
+"""
+
+from __future__ import annotations
+
 import numpy as np
 from scipy.stats import norm
-import matplotlib.pyplot as plt
-
-def black_scholes_price(S0, K, T, r, sigma, option_type="call"):
-    """Calcule le prix d'une option européenne (call ou put) selon Black-Scholes."""
-    if T <= 0 or sigma <= 0:
-        raise ValueError("T et sigma doivent être positifs")
-
-    d1 = (np.log(S0 / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-
-    if option_type == "call":
-        price = S0 * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    elif option_type == "put":
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S0 * norm.cdf(-d1)
-    else:
-        raise ValueError("option_type doit être 'call' ou 'put'")
-    return price
 
 
-def plot_payoff(S_range, K, option_type="call"):
-    """Trace le payoff du call ou du put à maturité."""
-    payoff = np.maximum(S_range - K, 0) if option_type == "call" else np.maximum(K - S_range, 0)
-    plt.plot(S_range, payoff, label=f"Payoff {option_type}")
-    plt.title(f"Payoff d'un {option_type.capitalize()} (K={K})")
-    plt.xlabel("Prix à maturité $S_T$")
-    plt.ylabel("Profit / Perte")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+def _d1_d2(S, K, r, sigma, T):
+    """
+    Internal helper: compute Black–Scholes d1 and d2.
+    Works for floats or NumPy arrays.
+    """
+    S = np.asarray(S, dtype=float)
+    K = np.asarray(K, dtype=float)
+    r = float(r)
+    sigma = float(sigma)
+    T = float(T)
+
+    sqrtT = np.sqrt(T)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    return d1, d2
 
 
-if __name__ == "__main__":
-    # Paramètres
-    S0 = 100     # prix spot
-    K = 100      # strike
-    T = 1.0      # 1 an
-    r = 0.03     # taux sans risque
-    sigma = 0.2  # volatilité
+def bs_call_price(S, K, r, sigma, T):
+    """
+    Black–Scholes price of a European CALL.
 
-    # Prix call & put
-    call = black_scholes_price(S0, K, T, r, sigma, "call")
-    put = black_scholes_price(S0, K, T, r, sigma, "put")
+    Parameters
+    ----------
+    S : float or array
+        Spot price(s).
+    K : float or array
+        Strike(s).
+    r : float
+        Risk-free rate (annual, continuously compounded).
+    sigma : float
+        Volatility (annual).
+    T : float
+        Time to maturity (in years).
 
-    print(f"Prix call BS : {call:.2f}")
-    print(f"Prix put BS  : {put:.2f}")
+    Returns
+    -------
+    float or np.ndarray
+        Call option price(s).
+    """
+    S = np.asarray(S, dtype=float)
+    K = np.asarray(K, dtype=float)
+    d1, d2 = _d1_d2(S, K, r, sigma, T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
-    # Payoff visuel
-    S_range = np.linspace(50, 150, 200)
-    plot_payoff(S_range, K, "call")
-    plot_payoff(S_range, K, "put")
+
+def bs_put_price(S, K, r, sigma, T):
+    """
+    Black–Scholes price of a European PUT.
+
+    Put–call parity: P = C + K e^{-rT} − S
+    """
+    S = np.asarray(S, dtype=float)
+    K = np.asarray(K, dtype=float)
+    call = bs_call_price(S, K, r, sigma, T)
+    return call + K * np.exp(-r * T) - S
+
+
+# Optional aliases if some old code uses other names
+bs_call = bs_call_price
+bs_put = bs_put_price
