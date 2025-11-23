@@ -1,63 +1,111 @@
 # pricing/implied_vol.py
+# Numerical implied volatility solver for Black–Scholes calls (Brent method)
+
+from __future__ import annotations
+
+import os
+import sys
 import numpy as np
-from scipy.stats import norm
-from scipy.optimize import brentq
-import matplotlib.pyplot as plt
+from math import sqrt
+
+# Make project importable when running this file directly
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+# ABSOLUTE IMPORT — no relative import here
+from pricing.black_scholes import bs_call_price
 
 
-def bs_price(S0, K, T, r, sigma, option_type="call"):
-    """Prix d'une option européenne (Black-Scholes analytique)."""
-    if sigma <= 0 or T <= 0:
-        return max(0.0, S0 - K) if option_type == "call" else max(0.0, K - S0)
-
-    d1 = (np.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    if option_type == "call":
-        return S0 * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S0 * norm.cdf(-d1)
-
-
-def implied_vol_bs(price, S0, K, T, r, option_type="call", tol=1e-6):
+# --------------------------------------------------------------
+# Implied volatility via Brent root finding
+# --------------------------------------------------------------
+def implied_vol_bs(
+    price: float,
+    S: float,
+    K: float,
+    r: float,
+    T: float,
+    tol: float = 1e-8,
+    max_iter: int = 100,
+) -> float:
     """
-    Calcule la volatilité implicite via recherche de racine (Brent).
-    Renvoie np.nan si le prix n'est pas dans le domaine valide.
+    Find the Black–Scholes implied volatility using Brent's method.
+
+    Parameters
+    ----------
+    price : float
+        Observed market call price.
+    S : float
+        Spot price.
+    K : float
+        Strike price.
+    r : float
+        Continuous interest rate.
+    T : float
+        Time to maturity in years.
+    tol : float
+        Numerical tolerance for convergence.
+    max_iter : int
+        Maximum number of iterations.
+
+    Returns
+    -------
+    float
+        Implied volatility (annualized).
     """
-    # bornes de recherche
-    def objective(sigma):
-        return bs_price(S0, K, T, r, sigma, option_type) - price
 
-    try:
-        # bornes typiques : 1% à 500%
-        vol = brentq(objective, 1e-4, 5.0, xtol=tol, maxiter=100)
-    except ValueError:
-        vol = np.nan
-    return vol
+    # Objective function: BS(sigma) - price
+    def f(sig):
+        return bs_call_price(S, K, r, sig, T) - price
+
+    # Bounds for volatility search
+    a, b = 1e-6, 5.0  # 500% volatility max allowed
+
+    fa, fb = f(a), f(b)
+
+    # If price is outside BS range, return NaN
+    if fa * fb > 0:
+        return np.nan
+
+    # Brent’s method loop
+    for _ in range(max_iter):
+        m = 0.5 * (a + b)
+        fm = f(m)
+
+        if abs(fm) < tol:
+            return m
+
+        if fa * fm < 0:
+            b, fb = m, fm
+        else:
+            a, fa = m, fm
+
+    # Did not converge
+    return np.nan
 
 
-def generate_smile(S0=100, T=1.0, r=0.03, true_sigma=0.2, option_type="call"):
-    """
-    Génère un smile de volatilité implicite à partir de prix Black-Scholes théoriques
-    (avec une 'vraie' vol) et les reconvertit via implied_vol_bs.
-    """
-    Ks = np.linspace(60, 140, 15)
-    prices = [bs_price(S0, K, T, r, true_sigma, option_type) for K in Ks]
-    implied_vols = [implied_vol_bs(p, S0, K, T, r, option_type) for p, K in zip(prices, Ks)]
+# --------------------------------------------------------------
+# TEST (only executed if run directly)
+# --------------------------------------------------------------
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
 
-    plt.figure(figsize=(7,4))
-    plt.plot(Ks / S0, implied_vols, marker='o', label='Vol implicite')
-    plt.axhline(true_sigma, color='k', ls='--', lw=1, label='Vol réelle')
-    plt.xlabel("Moneyness (K / S₀)")
-    plt.ylabel("Volatilité implicite")
-    plt.title("Smile de volatilité implicite (Black-Scholes)")
+    S0 = 100
+    K = 100
+    r = 0.00
+    T = 1.0
+    true_sigma = 0.20
+
+    price = bs_call_price(S0, K, r, true_sigma, T)
+    iv = implied_vol_bs(price, S0, K, r, T)
+
+    print("True σ:", true_sigma)
+    print("Implied σ:", iv)
+
+    # Simple test plot
+    plt.figure(figsize=(5,4))
+    plt.title("Implied volatility test")
+    plt.axhline(true_sigma, color="orange", label="true σ")
+    plt.scatter([0],[iv], color="blue", label="implied σ")
     plt.legend()
-    plt.grid(True)
     plt.tight_layout()
     plt.show()
-
-    return Ks, implied_vols
-
-
-if __name__ == "__main__":
-    S0, T, r, sigma_true = 100, 1.0, 0.03, 0.2
-    generate_smile(S0, T, r, sigma_true)
